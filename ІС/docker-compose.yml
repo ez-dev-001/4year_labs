@@ -1,0 +1,119 @@
+name: is-monitoring
+
+x-python: &python
+  build: ./app
+  restart: unless-stopped
+
+services:
+  # 0. СУБД у контейнері
+  postgres:
+    image: postgres:16-alpine
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: shop
+      POSTGRES_USER: shop
+      POSTGRES_PASSWORD: shop
+    ports: ["127.0.0.1:5433:5432"]   # для DBeaver/pgAdmin, лише з цього комп'ютера
+    volumes: [pg-data:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U shop -d shop"]
+      interval: 5s
+      retries: 10
+
+  # 1. Генерація й актуалізація даних (Python 3) + метрики, логи, трейси
+  generator:
+    <<: *python
+    command: python generator.py
+    environment:
+      DATABASE_URL: postgresql://shop:shop@postgres:5432/shop
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # метрики самої СУБД для Prometheus
+  postgres-exporter:
+    image: quay.io/prometheuscommunity/postgres-exporter:v0.17.1
+    restart: unless-stopped
+    environment:
+      DATA_SOURCE_NAME: postgresql://shop:shop@postgres:5432/shop?sslmode=disable
+    depends_on:
+      postgres: { condition: service_healthy }
+
+  # 2-3. Збір метрик + Time Series Storage (вбудована TSDB)
+  prometheus:
+    image: prom/prometheus:v3.5.0
+    restart: unless-stopped
+    command:
+      - --config.file=/etc/prometheus/prometheus.yml
+      - --storage.tsdb.path=/prometheus
+      - --storage.tsdb.retention.time=7d
+      - --web.external-url=/prometheus/
+      - --web.route-prefix=/
+    volumes:
+      - ./prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro
+      - prometheus-data:/prometheus
+
+  # 5. Логи: Alloy читає stdout контейнерів -> Loki
+  loki:
+    image: grafana/loki:3.5.3
+    restart: unless-stopped
+
+  alloy:
+    image: grafana/alloy:v1.10.0
+    restart: unless-stopped
+    command: run /etc/alloy/config.alloy
+    volumes:
+      - ./alloy/config.alloy:/etc/alloy/config.alloy:ro
+      - /var/run/docker.sock:/var/run/docker.sock:ro
+    depends_on: [loki]
+
+  # 6. Трейси (OTLP)
+  tempo:
+    image: grafana/tempo:2.8.2
+    restart: unless-stopped
+    command: -config.file=/etc/tempo.yaml
+    volumes: [./tempo/tempo.yaml:/etc/tempo.yaml:ro]
+
+  # 4. Відображення
+  grafana:
+    image: grafana/grafana:12.1.0
+    restart: unless-stopped
+    environment:
+      GF_SERVER_ROOT_URL: http://localhost:8080/
+      # вхід лише через сервер авторизації: nginx передає ім'я користувача заголовком
+      GF_AUTH_PROXY_ENABLED: "true"
+      GF_AUTH_PROXY_HEADER_NAME: X-WEBAUTH-USER
+      GF_AUTH_PROXY_HEADER_PROPERTY: username
+      GF_AUTH_PROXY_AUTO_SIGN_UP: "true"
+      GF_AUTH_DISABLE_LOGIN_FORM: "true"
+      GF_AUTH_SIGNOUT_REDIRECT_URL: http://localhost:8080/auth/logout
+      GF_USERS_AUTO_ASSIGN_ORG_ROLE: Editor
+      GF_DASHBOARDS_DEFAULT_HOME_DASHBOARD_PATH: /var/lib/grafana/dashboards/db.json
+    volumes:
+      - ./grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./grafana/dashboards:/var/lib/grafana/dashboards:ro
+      - grafana-data:/var/lib/grafana
+
+  # 7. Сервер авторизації (Python 3 + SQLite)
+  auth:
+    <<: *python
+    command: python auth.py
+    environment:
+      ADMIN_USER: admin
+      ADMIN_PASSWORD: admin123
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://tempo:4318
+    volumes: [auth-data:/data]
+
+  # єдиний вхід: усе, крім сторінки логіну, - лише після авторизації
+  nginx:
+    image: nginx:1.29-alpine
+    restart: unless-stopped
+    ports: ["8080:80"]
+    volumes: [./nginx/nginx.conf:/etc/nginx/nginx.conf:ro]
+    depends_on: [auth, grafana, prometheus]
+
+volumes:
+  pg-data:
+  prometheus-data:
+  grafana-data:
+  auth-data:
